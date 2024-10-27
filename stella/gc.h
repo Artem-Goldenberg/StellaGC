@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#define MAX_ALLOC_SIZE (1LU << 12)
+
 /** This macro is used whenever the runtime wants to READ a heap object's field.
  */
 #define GC_READ_BARRIER(object, field_index, read_code) (void *)(gc_read_barrier(object, field_index), read_code) // NO BARRIER
