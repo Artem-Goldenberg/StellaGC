@@ -6,6 +6,9 @@ sources = $(src)/runtime.c $(src)/gc.c
 targets = factorial
 
 CFLAGS += -std=c11
+CFLAGS += -Wall -Wextra
+CFLAGS += -Wno-unused-parameter -Wno-zero-length-array
+CFLAGS += -Wno-self-assign
 
 ifneq ($(DEBUG),)
 CFLAGS += -DSTELLA_DEBUG
