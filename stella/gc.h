@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#define MAX_ALLOC_SIZE (1LU << 12)
+#define MAX_ALLOC_SIZE (1LU << 15)
 
 /** This macro is used whenever the runtime wants to READ a heap object's field.
  */

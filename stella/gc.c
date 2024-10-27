@@ -85,12 +85,10 @@ void print_gc_state(void) {
 
 #define FC(ptr) STELLA_OBJECT_HEADER_FIELD_COUNT((ptr)->object_header)
 #define IN(space, ptr) (gc.space <= (char*)(ptr) && (char*)(ptr) < gc.space + HEAP)
+#define Forwarded(ptr) (IN(toSpace, ((stella_object*)(ptr))->object_fields[0]))
 
 void gc_read_barrier(void *object, int field_index) {
-    if (IN(toSpace, object)) {
-        stella_object* p = object;
-        p->object_fields[field_index] = forward(p->object_fields[field_index]);
-    }
+    assert(!IN(toSpace, object));
     total_reads += 1;
 }
 
@@ -123,7 +121,7 @@ static void initialize(void) {
     gc.fromSpace = malloc(HEAP);
 }
 
-static int getSize(stella_object* p) {
+static size_t getSize(stella_object* p) {
     return (1 + FC(p)) * sizeof(void*);
 }
 
@@ -131,24 +129,38 @@ static void copyObject(void* dst, stella_object* src) {
     memcpy(dst, src, getSize(src));
 }
 
+static stella_object* chase(stella_object* p) {
+    stella_object* current = p;
+    while (current) {
+        stella_object* next = NULL;
+        for (int f = 0; f < FC(current); ++f) {
+            void* field = current->object_fields[f];
+            if (IN(fromSpace, field) && !Forwarded(field)) {
+                next = field;
+                break;
+            }
+        }
+        size_t size = getSize(current);
+        stella_object* dst = (stella_object*)(gc.toSpace + gc.next);
+        memcpy(dst, current, size);
+        gc.next += size;
+        assert(gc.next < HEAP);
+        current->object_fields[0] = dst;
+        current = next;
+    }
+    
+    return p->object_fields[0];
+}
+
 static stella_object* forward(stella_object* p) {
-    if (IN(toSpace, p)) return p; // already in to-space
-    if (!IN(fromSpace, p)) return p; // unknown object
+    if (!IN(fromSpace, p)) return p; // already in to-space or unknown
 
     assert(FC(p) > 0);
 
     stella_object* field0 = p->object_fields[0];
-    if (IN(toSpace, field0)) return field0;
+    if (IN(toSpace, field0)) return field0; // already forwarded
 
-    int size = getSize(p);
-    void* dst = gc.toSpace + gc.next;
-    memcpy(dst, p, size);
-    gc.next += size;
-    assert(gc.next < HEAP);
-
-    p->object_fields[0] = dst;
-
-    return dst;
+    return chase(p);
 }
 
 static void collect(void) {
