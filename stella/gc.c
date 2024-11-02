@@ -69,11 +69,11 @@ static struct {
     size_t maxObjects;
 } gc;
 
-static Location getLocationFor(const stella_object* p);
+static Location getLocationFor(const void* p);
 
 static void collect(void);
 static void initialize(void);
-static bool markCellAt(void* ptr, int toGen);
+static bool markCellAt(const void* ptr, int toGen);
 static stella_object* forward(stella_object* p);
 static size_t getSize(const stella_object* p);
 
@@ -258,8 +258,9 @@ void gc_read_barrier(void *object, int field_index) {
 void gc_write_barrier(void *object, int field_index, void *contents) {
     total_writes += 1;
     Location loc = getLocationFor(contents);
-    if (loc.space == FromSpace && loc.gen < NGENS - 1) {
-        bool res = markCellAt(object, loc.gen);
+    if (loc.space == FromSpace) {
+        void* field = ((stella_object*)object)->object_fields + field_index;
+        bool res = markCellAt(field, loc.gen);
         if (!res)
             printf("Cell not marked at %p, setting to %p\n", object, contents);
     }
@@ -327,17 +328,19 @@ static void initialize(void) {
     gc.offsets[NGENS - 1] = 0;
     for (int gen = NGENS - 2; gen >= 0; --gen)
         gc.offsets[gen] = 
-            gc.offsets[gen + 1] + gc.generations[gen].segmentSize * NSEGMENTS(gen);
-    for (int gen = 0; gen < NGENS - 1; ++gen)
+            gc.offsets[gen + 1] + gc.generations[gen + 1].segmentSize * NSEGMENTS(gen + 1);
+    for (int gen = 0; gen < NGENS - 1; ++gen) {
         gc.marks[gen] = calloc(MarksToCover(gc.offsets[gen]), sizeof(byte));
+        assert(gc.marks[gen]);
+    }
 }
 
-static bool markCellAt(void* ptr, int toGen) {
+static bool markCellAt(const void* ptr, int toGen) {
     Location loc = getLocationFor(ptr);
     assert(loc.space == FromSpace);
-    if (loc.gen == 0) return false;
+    if (loc.gen <= toGen) return false;
 
-    assert(gc.offsets[toGen] - gc.offsets[loc.gen - 1] > 0LL);
+    assert(gc.offsets[toGen] - gc.offsets[loc.gen - 1] >= 0LL);
 
     size_t skipSize = gc.offsets[toGen] - gc.offsets[loc.gen - 1];
     size_t nskipBytes = MarksToCover(skipSize);
@@ -357,7 +360,7 @@ static size_t getSize(const stella_object* p) {
     return (1 + FC(p)) * sizeof(void*);
 }
 
-static Location getLocationFor(const stella_object* p) {
+static Location getLocationFor(const void* p) {
     for (int gen = 0; gen < NGENS; ++gen) {
         Generation* g = gc.generations + gen;
         if (In(gen, FromSpace, p)) return (Location) {
@@ -502,14 +505,16 @@ static void forwardInCells(int toGen) {
     int fromGen = toGen + 1;
 
     size_t covered = 0;
-    for (unsigned i = 0; i < MarksToCover(gc.offsets[toGen]); ++i, covered *= CELL_SIZE * 8) {
-        if (covered > gc.generations[fromGen].segmentSize * NSEGMENTS(fromGen)) {
+    for (unsigned i = 0; i < MarksToCover(gc.offsets[toGen]); ++i, covered += CELL_SIZE * 8) {
+        if (covered >= gc.generations[fromGen].segmentSize * NSEGMENTS(fromGen)) {
+            assert(covered == gc.generations[fromGen].segmentSize * NSEGMENTS(fromGen));
             fromGen++;
             covered = 0;
         }
         while (cells[i] != 0) {
-            int cellIndex = __builtin_clz(cells[i]);
-            void* cellStart = gc.generations[fromGen].fromSpace + covered;
+            int cellIndex = __builtin_clz(cells[i]) - 24;
+            void* cellStart =
+                gc.generations[fromGen].fromSpace + covered + (7 - cellIndex) * CELL_SIZE;
             forwardInCell(cellStart);
             cells[i] &= 0xFF >> (cellIndex + 1);
         }
@@ -608,6 +613,7 @@ static void collect(void) {
                 forwardInLocation(destLoc);
             }
         }
+        cmp = 0;
         for (int gen = 0; gen <= gc.collectGen && cmp == 0; ++gen) {
             Generation* g = gc.generations + gen;
             cmp = memcmp(g->next, g->scan, NSEGMENTS(gen) * sizeof(size_t));
