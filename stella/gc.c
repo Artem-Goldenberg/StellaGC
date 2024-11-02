@@ -8,15 +8,6 @@
 #include "runtime.h"
 #include "gc.h"
 
-/** Total allocated number of bytes (over the entire duration of the program). */
-int total_allocated_bytes = 0;
-
-/** Total allocated number of objects (over the entire duration of the program). */
-int total_allocated_objects = 0;
-
-int max_allocated_bytes = 0;
-int max_allocated_objects = 0;
-
 int total_reads = 0;
 int total_writes = 0;
 
@@ -38,6 +29,13 @@ typedef struct {
     size_t* next;
     /// Scan pointers as well for convinience
     size_t* scan;
+
+    /// Amount of allocated objects in each segment
+    size_t* objects;
+    /// Maximum amount of allocated objects ever in this generation
+    size_t maxObjects;
+    /// Maximum memory ever allocated in this gen
+    size_t maxAlloc;
 } Generation;
 
 typedef struct {
@@ -49,7 +47,7 @@ typedef struct {
 static struct {
     Generation generations[NGENS];
 
-    /// Generation, up to which we are currently collecting
+    /// Generation, up to which we are currently collecting, -1 if not collecting
     int collectGen;
 
     /// `next` pointer of the generation which goes after the last one we're collecting
@@ -57,14 +55,18 @@ static struct {
     /// whether the object is forwarded to the last generations's `fromSpace`
     size_t barrier;
 
-    /// Utility variable to store last copied location
-    Location lastLoc;
-
     /// Cumulative sizes for each generation backwards (see `initialize`)
     size_t offsets[NGENS];
 
     /// Cells to mark when user writes to memory, for each generation
     byte* marks[NGENS - 1];
+
+    /// Amount of times each generation has been collected
+    int timesCollected[NGENS];
+    /// Maximum total bytes ever allocated
+    size_t maxAlloc;
+    /// Maximum total amount of objects
+    size_t maxObjects;
 } gc;
 
 static Location getLocationFor(const stella_object* p);
@@ -73,11 +75,13 @@ static void collect(void);
 static void initialize(void);
 static bool markCellAt(void* ptr, int toGen);
 static stella_object* forward(stella_object* p);
+static size_t getSize(const stella_object* p);
 
-size_t allocSize(void) {
-    return MAX_ALLOC_SIZE;
-}
+#define FC(ptr) STELLA_OBJECT_HEADER_FIELD_COUNT((ptr)->object_header)
 
+#define MarksToCover(size) ((size) / (CELL_SIZE) / 8u)
+
+#define GetTop(gen, space, seg) ((gen).space + (gen).segmentSize * (seg) + (gen).next[seg])
 
 void* gc_alloc(size_t size_in_bytes) {
     Generation* new = gc.generations; // first generation
@@ -92,11 +96,14 @@ void* gc_alloc(size_t size_in_bytes) {
 
     void* dst = new->fromSpace + new->next[0]; // first segment
     new->next[0] += size_in_bytes;
+    new->objects[0]++;
 
-    total_allocated_bytes += size_in_bytes;
-    total_allocated_objects += 1;
-    max_allocated_bytes = total_allocated_bytes;
-    max_allocated_objects = total_allocated_objects;
+    new->maxAlloc += size_in_bytes;
+    new->maxObjects++;
+
+    gc.maxAlloc += size_in_bytes;
+    gc.maxObjects++;
+
     return dst;
 }
 
@@ -108,15 +115,140 @@ void print_gc_roots(void) {
     printf("\n");
 }
 
+static const char genTableHeader[] =
+"| Generation | Bytes    | MaxBytes | Objects | MaxObjects | Times Collected |";
+static const char segTableHeader[] =
+"| Segment | Bytes     | Objects |";
+
+static void printSegRowSep(void) {
+    for (unsigned i = 1; i < sizeof segTableHeader; ++i) putchar('-');
+    printf("\n");
+}
+static void printGenRowSep(void) {
+    for (unsigned i = 1; i < sizeof genTableHeader; ++i) putchar('-');
+    printf("\n");
+}
+
 void print_gc_alloc_stats(void) {
-    printf("Total memory allocation: %'d bytes (%'d objects)\n", total_allocated_bytes, total_allocated_objects);
-    printf("Maximum residency:       %'d bytes (%'d objects)\n", max_allocated_bytes, max_allocated_objects);
+    size_t totalBytes = 0;
+    size_t totalObject = 0;
+    int totalCollections = 0;
+
+    // amount of allocated bytes and objects for each generation
+    static size_t bytes[NGENS];
+    static size_t objects[NGENS];
+
+    printf("\nDetails about each generations:\n");
+
+    for (int gen = 0; gen < NGENS; ++gen) {
+        size_t genBytes = 0, genObjects = 0;
+
+        Generation* g = gc.generations + gen;
+
+        printf("\nGeneration %d (segments size = %zu bytes):\n", gen, g->segmentSize);
+
+        printSegRowSep();
+        puts(segTableHeader);
+        printSegRowSep();
+
+        for (int seg = 0; seg < NSEGMENTS(gen); ++seg) {
+            genBytes += g->next[seg];
+            genObjects += g->objects[seg];
+            printf("| %-7d | %-9zu | %-7zu |\n", seg, g->next[seg], g->objects[seg]);
+        }
+        printSegRowSep();
+
+        totalBytes += genBytes;
+        totalObject += genObjects;
+        totalCollections += gc.timesCollected[gen];
+
+        bytes[gen] = genBytes;
+        objects[gen] = genObjects;
+    }
+
+    printf("\nOverview Table:\n");
+
+    printGenRowSep();
+    puts(genTableHeader);
+    printGenRowSep();
+
+    for (int gen = 0; gen < NGENS; ++gen) {
+        Generation* g = gc.generations + gen;
+        printf("| %-10d | %-8zu | %-8zu | %-7zu | %-10zu | %-15d | \n",
+               gen, bytes[gen], g->maxAlloc,
+               objects[gen], g->maxObjects,
+               gc.timesCollected[gen]);
+    }
+
+    printGenRowSep();
+
+    printf("| Total      | %-8zu | %-8zu | %-7zu | %-10zu | %-15d | \n",
+           totalBytes, gc.maxAlloc,
+           totalObject, gc.maxObjects,
+           totalCollections);
+
+    printGenRowSep();
+
+    printf("\n");
     printf("Total memory use:        %'d reads and %'d writes\n", total_reads, total_writes);
-    printf("Max GC roots stack size: %'d roots\n", gc_roots_max_size);
+    printf("Max GC roots stack size: %d roots\n", gc_roots_max_size);
 }
 
 void print_gc_state(void) {
-    // TODO: not implemented
+
+    /* 
+     <0xFF32AC42>: {<0xAABC4342134>, <0xEF12C3221AC>}
+    */
+
+    printf("\nGarbage collector state:\n\n");
+
+    if (gc.collectGen == -1)
+        printf("Currently idle\n");
+    else
+        printf("Currently collecting up to Generation %d, printing info about to-spaces...\n",
+               gc.collectGen);
+
+    for (int gen = 0; gen < NGENS; ++gen) {
+        Generation* g = gc.generations + gen;
+        char* space = (gc.collectGen == -1 ? g->fromSpace : g->toSpace);
+
+        printf("Generation %d:\n", gen);
+
+        size_t genSize = NSEGMENTS(gen) * g->segmentSize;
+        printf("\tFromSpace: %zu bytes: <%p>...<%p>\n",
+               genSize, g->fromSpace, g->fromSpace + genSize);
+        printf("\tToSpace: %zu bytes: <%p>...<%p>\n",
+               genSize, g->toSpace, g->toSpace + genSize);
+
+        printf("\tWith %d segments of %zu bytes:\n", NSEGMENTS(gen), g->segmentSize);
+
+        for (int seg = 0; seg < NSEGMENTS(gen); ++seg, space += g->segmentSize) {
+
+            printf("\tSegment %d: <%p>...<%p>:\n", seg, space, space + g->segmentSize);
+            printf("\t\tAllocated: %zu bytes\n", g->next[seg]);
+            printf("\t\tAvailable: %zu bytes\n", g->segmentSize - g->next[seg]);
+
+            printf("\t\tTotal of %zu objects:\n", g->objects[seg]);
+
+            for (size_t offset = 0; offset < g->next[seg];) {
+                const stella_object* p = (stella_object*)(space + offset);
+                if (FC(p) == 0) {
+                    printf("Incomplete or corrupted object at %p, aborting...\n", p);
+                    printf("Try printing later...");
+                    return;
+                }
+                assert(FC(p) > 0);
+                printf("\t\t\t<%p>: {<%p>", p, p->object_fields[0]);
+                for (int f = 1; f < FC(p); ++f) {
+                    printf(", <%p>", p->object_fields[f]);
+                }
+                printf("}\n");
+                offset += getSize(p);
+            }
+        }
+    }
+
+    print_gc_roots();
 }
 
 void gc_read_barrier(void *object, int field_index) {
@@ -143,12 +275,6 @@ void gc_pop_root(void **ptr){
     gc_roots_top--;
 }
 
-#define FC(ptr) STELLA_OBJECT_HEADER_FIELD_COUNT((ptr)->object_header)
-
-#define MarksToCover(size) ((size) / (CELL_SIZE) / 8u)
-
-#define GetTop(gen, space, seg) ((gen).space + (gen).segmentSize * (seg) + (gen).next[seg])
-
 #define In(gen, space, p) ( \
     InRange(\
         p, \
@@ -165,7 +291,7 @@ void gc_pop_root(void **ptr){
 int fc(stella_object* p) {
     return FC(p);
 }
-int segs(int gen) {
+int nsegs(int gen) {
     return NSEGMENTS(gen);
 }
 void * getToSpace(Generation* gen, int seg) {
@@ -174,24 +300,29 @@ void * getToSpace(Generation* gen, int seg) {
 void * getFromSpace(Generation* gen, int seg) {
     return GetTop(*gen, fromSpace, seg);
 }
+size_t allocSize(void) {
+    return MAX_ALLOC_SIZE;
+}
 
 static int init = 0;
 static void initialize(void) {
     init += 1;
     assert(init == 1);
-    gc.lastLoc.space = NoSpace;
+    gc.collectGen = -1;
     for (size_t gen = 0, size = MAX_ALLOC_SIZE; gen < NGENS; ++gen, size = GEN_SIZE(size)) {
         gc.generations[gen] = (Generation) {
             .toSpace = malloc(size * NSEGMENTS(gen)),
             .fromSpace = malloc(size * NSEGMENTS(gen)),
             .segmentSize = size,
             .next = calloc(NSEGMENTS(gen), sizeof(size_t)),
-            .scan = calloc(NSEGMENTS(gen), sizeof(size_t))
+            .scan = calloc(NSEGMENTS(gen), sizeof(size_t)),
+            .objects = calloc(NSEGMENTS(gen), sizeof(size_t)),
         };
         assert(gc.generations[gen].toSpace);
         assert(gc.generations[gen].fromSpace);
         assert(gc.generations[gen].next);
         assert(gc.generations[gen].scan);
+        assert(gc.generations[gen].objects);
     }
     gc.offsets[NGENS - 1] = 0;
     for (int gen = NGENS - 2; gen >= 0; --gen)
@@ -199,10 +330,6 @@ static void initialize(void) {
             gc.offsets[gen + 1] + gc.generations[gen].segmentSize * NSEGMENTS(gen);
     for (int gen = 0; gen < NGENS - 1; ++gen)
         gc.marks[gen] = calloc(MarksToCover(gc.offsets[gen]), sizeof(byte));
-}
-
-static size_t getSize(const stella_object* p) {
-    return (1 + FC(p)) * sizeof(void*);
 }
 
 static bool markCellAt(void* ptr, int toGen) {
@@ -224,6 +351,10 @@ static bool markCellAt(void* ptr, int toGen) {
 
     gc.marks[toGen][nskipBytes + markIndex] |= 0x1 << bit;
     return true;
+}
+
+static size_t getSize(const stella_object* p) {
+    return (1 + FC(p)) * sizeof(void*);
 }
 
 static Location getLocationFor(const stella_object* p) {
@@ -289,12 +420,6 @@ static void* transformToDestination(Location* loc) {
     return GetTop(*gen, toSpace, loc->segment);
 }
 
-static bool locLess(const Location* a, const Location* b) {
-    if (a->gen < b->gen) return true;
-    if (a->gen > b->gen) return false;
-    return a->segment < b->segment;
-}
-
 /// Checks if the object is already forwarded to the destination location `toLoc`
 /// Returns pointer to the forwarded object if found, else `NULL`
 static stella_object* isForwarded(const stella_object* p, const Location* toLoc) {
@@ -330,10 +455,7 @@ static stella_object* forward(stella_object* p) {
     assert(dst);
     assert(FC(current) > 0);
 
-//    void* field0 = current->object_fields[0];
     if ((next = isForwarded(current, &destLoc))) return next; // already forwarded
-
-    gc.lastLoc = destLoc;
 
     while (current) {
         assert(FC(current) > 0);
@@ -342,6 +464,8 @@ static stella_object* forward(stella_object* p) {
 
         size_t objectSize = getSize(current);
         destGen->next[destLoc.segment] += objectSize;
+        destGen->objects[destLoc.segment]++;
+        // out of memory
         assert(destGen->next[destLoc.segment] <= destGen->segmentSize);
 
         dst->object_header = current->object_header;
@@ -355,13 +479,8 @@ static stella_object* forward(stella_object* p) {
 
             // if field is poining to the same gen and segment as `loc`
             // and is not yet forwarded, then copy this field next
-            if (atLocation(field, &loc) && !isForwarded(field, &destLoc)) {
+            if (atLocation(field, &loc) && !isForwarded(field, &destLoc))
                 next = field;
-//                if (!isForwarded(field, &destLoc)) next = field;
-//                void* innerField0 = ((stella_object*)field)->object_fields[0];
-//                if (!atLocation(innerField0, &destLoc)) // not yet forwarded
-//                    next = field;
-            }
         }
         current->object_fields[0] = dst;
         dst = (stella_object*)((char*)dst + objectSize);
@@ -383,7 +502,7 @@ static void forwardInCells(int toGen) {
     int fromGen = toGen + 1;
 
     size_t covered = 0;
-    for (int i = 0; i < MarksToCover(gc.offsets[toGen]); ++i, covered *= CELL_SIZE * 8) {
+    for (unsigned i = 0; i < MarksToCover(gc.offsets[toGen]); ++i, covered *= CELL_SIZE * 8) {
         if (covered > gc.generations[fromGen].segmentSize * NSEGMENTS(fromGen)) {
             fromGen++;
             covered = 0;
@@ -430,8 +549,23 @@ static int generationToCollect(void) {
 
 #define Swap(type, a, b) do {type tmp = a; a = b; b = tmp;} while (0)
 
-int nsegs(int gen) {
-    return NSEGMENTS(gen);
+static void updateStats(void) {
+    size_t totalBytes = 0, totalObjects = 0;
+    for (int gen = 0; gen < NGENS; ++gen) {
+        size_t genBytes = 0, genObjects = 0;
+        for (int seg = 0; seg < NSEGMENTS(gen); ++seg) {
+            genBytes += gc.generations[gen].next[seg];
+            genObjects += gc.generations[gen].objects[seg];
+        }
+        if (genBytes > gc.generations[gen].maxAlloc)
+            gc.generations[gen].maxAlloc = genBytes;
+        if (genObjects > gc.generations[gen].maxObjects)
+            gc.generations[gen].maxObjects = genObjects;
+        totalBytes += genBytes;
+        totalObjects += genObjects;
+    }
+    if (totalBytes > gc.maxAlloc) gc.maxAlloc = totalBytes;
+    if (totalObjects > gc.maxObjects) gc.maxObjects = totalObjects;
 }
 
 static void collect(void) {
@@ -443,21 +577,14 @@ static void collect(void) {
         gc.barrier = gc.generations[gc.collectGen + 1].next[0];
     }
 
-    printf("Collecting garbage for %d\n", gc.collectGen);
-
-//    assert(gc.collectGen != NGENS - 1);
-
     // set `next` and `scan` to 0 in generations we are about to collect
     for (int gen = 0; gen <= gc.collectGen; ++gen) {
         memset(gc.generations[gen].next, 0, NSEGMENTS(gen) * sizeof(size_t));
         memset(gc.generations[gen].scan, 0, NSEGMENTS(gen) * sizeof(size_t));
+        // stats
+        memset(gc.generations[gen].objects, 0, NSEGMENTS(gen) * sizeof(size_t));
+        gc.timesCollected[gen]++;
     }
-
-    // last segment of last collected gen will be appended to from-space of next gen
-//    size_t lastScanStart = 0; // so need to know, where to start scanning there
-//    if (gc.collectGen < NGENS - 1) { // if not last gen
-//        lastScanStart = gc.generations[gc.collectGen + 1].next[0];
-//    }
 
     // forward all roots
     for (int i = 0; i < gc_roots_top; ++i) {
@@ -468,9 +595,10 @@ static void collect(void) {
     for (int gen = 0; gen <= gc.collectGen; ++gen)
         forwardInCells(gen);
 
+    // bfs scan
     Location destLoc;
     int cmp = 0;
-    do {
+    do { // until scans in all generations won't be equal to nexts
         for (int gen = 0; gen <= gc.collectGen; ++gen) {
             for (int seg = 0; seg < NSEGMENTS(gen); ++seg) {
                 // find out where we copied this segment
@@ -486,6 +614,11 @@ static void collect(void) {
         }
     } while (cmp != 0);
 
+    updateStats();
+
+    // to space and from space swap
     for (int gen = 1; gen <= gc.collectGen; ++gen)
         Swap(char*, gc.generations[gen].fromSpace, gc.generations[gen].toSpace);
+
+    gc.collectGen = -1;
 }

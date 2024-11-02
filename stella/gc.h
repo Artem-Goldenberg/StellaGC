@@ -10,13 +10,13 @@
 #define MAX_ALLOC_SIZE (1LU << 10)
 
 /// Number of generations, including the youngest one
-#define NGENS 3U
+#define NGENS 3
 
 /// Segment size (bytes) for each generation, given segment size of the generation before this one
 #define GEN_SIZE(genSizeBefore) ((genSizeBefore) * 2U)
 /// Number of iterations the object can live in the generation `0 <= gen < NGENS`
 /// i.e. number of segments in each generation (segments have the same size)
-#define NSEGMENTS(gen) ((gen) == 0 ? 1U : 3U)
+#define NSEGMENTS(gen) ((gen) == 0 ? 1 : 3)
 
 /// Granularity of cells, by which mutated data will be tracked (byte size of one cell)
 #define CELL_SIZE 16LU
