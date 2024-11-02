@@ -260,9 +260,7 @@ void gc_write_barrier(void *object, int field_index, void *contents) {
     Location loc = getLocationFor(contents);
     if (loc.space == FromSpace) {
         void* field = ((stella_object*)object)->object_fields + field_index;
-        bool res = markCellAt(field, loc.gen);
-        if (!res)
-            printf("Cell not marked at %p, setting to %p\n", object, contents);
+        markCellAt(field, loc.gen);
     }
 }
 
@@ -468,8 +466,12 @@ static stella_object* forward(stella_object* p) {
         size_t objectSize = getSize(current);
         destGen->next[destLoc.segment] += objectSize;
         destGen->objects[destLoc.segment]++;
+
         // out of memory
-        assert(destGen->next[destLoc.segment] <= destGen->segmentSize);
+        if (destGen->next[destLoc.segment] > destGen->segmentSize) {
+            printf("Fatal Error: not enough memory to continue\n");
+            exit(EXIT_FAILURE);
+        }
 
         dst->object_header = current->object_header;
         for (int f = 0; f < FC(current); ++f) {

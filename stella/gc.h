@@ -7,7 +7,7 @@
 /// Heap size of the youngest generation of objects in bytes (only from-space)
 /// If objects stay in 0th gen for more than one iteration,
 /// then it is the size of the **first segment**
-#define MAX_ALLOC_SIZE (1LU << 10)
+#define MAX_ALLOC_SIZE (1LU << 11)
 
 /// Number of generations, including the youngest one
 #define NGENS 3
