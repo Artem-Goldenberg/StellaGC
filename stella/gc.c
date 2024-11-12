@@ -17,8 +17,6 @@ int gc_roots_max_size = 0;
 int gc_roots_top = 0;
 void **gc_roots[MAX_GC_ROOTS];
 
-#define HEAP (MAX_ALLOC_SIZE / 2)
-
 typedef unsigned char byte;
 
 typedef struct {
@@ -285,23 +283,6 @@ void gc_pop_root(void **ptr){
     ((char*)(ptr) <= (char*)(p) && (char*)(p) < (char*)(ptr) + (size))
 #define Segment(p, ptr, segSize) \
     (((char*)(p) - (char*)(ptr)) / (segSize))
-
-// TODO: debug
-int fc(stella_object* p) {
-    return FC(p);
-}
-int nsegs(int gen) {
-    return NSEGMENTS(gen);
-}
-void * getToSpace(Generation* gen, int seg) {
-    return GetTop(*gen, toSpace, seg);
-}
-void * getFromSpace(Generation* gen, int seg) {
-    return GetTop(*gen, fromSpace, seg);
-}
-size_t allocSize(void) {
-    return MAX_ALLOC_SIZE;
-}
 
 static int init = 0;
 static void initialize(void) {
